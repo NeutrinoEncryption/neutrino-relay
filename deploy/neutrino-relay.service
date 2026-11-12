@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 User=neutrino
 Environment=NEUTRINO_RELAY_BIND=127.0.0.1:8787
+Environment=NEUTRINO_RELAY_UDP_BIND=0.0.0.0:3479
 ExecStart=/usr/local/bin/neutrino-relay
 Restart=always
 RestartSec=2

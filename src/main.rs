@@ -8,6 +8,8 @@
 //! keyed hashes derived by clients and payloads are XChaCha20-Poly1305 ciphertext.
 //! Per-client connection and request limits are enforced by the reverse proxy.
 
+mod udp;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -46,6 +48,18 @@ impl Drop for ConnGuard {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    let udp_bind =
+        std::env::var("NEUTRINO_RELAY_UDP_BIND").unwrap_or_else(|_| "0.0.0.0:3479".into());
+    let config = udp::Config::from_env()?;
+    let socket = tokio::net::UdpSocket::bind(&udp_bind).await?;
+    eprintln!("neutrino-relay UDP listening on {}", socket.local_addr()?);
+    tokio::select! {
+        result = udp::run(socket, config) => result,
+        result = websocket() => result,
+    }
+}
+
+async fn websocket() -> std::io::Result<()> {
     let bind = std::env::var("NEUTRINO_RELAY_BIND").unwrap_or_else(|_| "127.0.0.1:8787".into());
     let listener = TcpListener::bind(&bind).await?;
     eprintln!("neutrino-relay listening on {bind}");
@@ -76,7 +90,12 @@ async fn main() -> std::io::Result<()> {
     }
 }
 
-async fn handle(tcp: TcpStream, guard: ConnGuard, gen: u64, waiting: Waiting) -> Result<(), String> {
+async fn handle(
+    tcp: TcpStream,
+    guard: ConnGuard,
+    gen: u64,
+    waiting: Waiting,
+) -> Result<(), String> {
     let _ = tcp.set_nodelay(true);
     let mut cfg = WebSocketConfig::default();
     cfg.max_message_size = Some(MAX_MESSAGE);
@@ -179,8 +198,18 @@ async fn pipe(a: Ws, b: Ws, ticket: [u8; 16]) {
     // Pairing notice: an empty envelope carrying the ticket.
     let mut notice = ticket.to_vec();
     notice.extend_from_slice(&[0, 0, 0, 0]);
-    if a_tx.lock().await.send(Message::Binary(notice.clone().into())).await.is_err()
-        || b_tx.lock().await.send(Message::Binary(notice.into())).await.is_err()
+    if a_tx
+        .lock()
+        .await
+        .send(Message::Binary(notice.clone().into()))
+        .await
+        .is_err()
+        || b_tx
+            .lock()
+            .await
+            .send(Message::Binary(notice.into()))
+            .await
+            .is_err()
     {
         return;
     }
@@ -205,8 +234,16 @@ async fn pipe(a: Ws, b: Ws, ticket: [u8; 16]) {
         tick.tick().await;
         loop {
             tick.tick().await;
-            let _ = a_tx.lock().await.send(Message::Ping(Vec::new().into())).await;
-            let _ = b_tx.lock().await.send(Message::Ping(Vec::new().into())).await;
+            let _ = a_tx
+                .lock()
+                .await
+                .send(Message::Ping(Vec::new().into()))
+                .await;
+            let _ = b_tx
+                .lock()
+                .await
+                .send(Message::Ping(Vec::new().into()))
+                .await;
         }
     };
     tokio::pin!(ab, ba);
