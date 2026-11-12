@@ -20,3 +20,8 @@ pedantic = { level = "warn", priority = -1 }
 tokio = { version = "1.43", features = ["full"] }
 tokio-tungstenite = "0.26"
 futures-util = "0.3"
+hmac = "0.12"
+sha2 = "0.10"
+getrandom = "0.2"
+zeroize = "1.8"
+subtle = "2.6"

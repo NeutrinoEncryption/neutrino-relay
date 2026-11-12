@@ -28,70 +28,193 @@ WebSocket at `/v1/relay`. TLS is terminated by your reverse proxy.
 
 Limits: 4 MiB per message; 1 h to wait for a partner; 90 s idle (the relay pings every 25 s, and live clients answer); 2048 pending registrations; 4096 connections. A newer registration for the same ticket replaces a stale one.
 
-## UDP protocol (raw QUIC relay)
+## UDP protocol v2 (raw QUIC relay)
 
-UDP listens on `0.0.0.0:3479` by default, independently of WebSocket. It carries
-end-to-end QUIC datagrams, preserving QUIC congestion control without TCP
-head-of-line blocking. It does not terminate QUIC or inspect its ciphertext.
+UDP listens on `0.0.0.0:3479` by default, independently of the WebSocket listener
+and nginx. It forwards end-to-end QUIC datagrams verbatim, so QUIC congestion
+control works without TCP head-of-line blocking. The relay does not terminate QUIC
+and cannot read its ciphertext. v1 (`NRU1`) is not supported: no released client
+used it, and an `NRU1` datagram is treated as ordinary data from an unregistered
+source and dropped.
 
-* Registration is **exactly 21 bytes**: ASCII `NRU1` (4 bytes), the keyed
-  16-byte ticket (opaque bytes, no integer encoding), then one role byte: `0`
-  for the initiating peer, `1` for its partner. Clients must agree on roles.
-* The first registration waits silently. Two **distinct source IP:port addresses**
-  with the same ticket and opposite roles pair. The relay sends each its own
-  exact 21-byte registration as the pairing notice (including its own role).
-  A repeated registration while pending has no response. Once paired, an exact
-  repeat registration elicits a notice **only to its sender**, allowing retries
-  after lost notices without repeatedly sending to the other peer.
-* After pairing, every other datagram is forwarded **verbatim**, with no prefix,
-  from the relay's UDP address to the partner. A source address identifies one
-  allocation on this socket; it cannot register a different ticket or change
-  roles until that allocation expires. Malformed/unknown traffic is dropped
-  before pairing. An exact registration matching the current ticket and role is
-  reserved control traffic even after pairing.
-* NAT rebinding is not inferred from ciphertext. From its new UDP socket/address,
-  a peer sends the same ticket and role. This replaces its old address immediately
-  and returns a notice if paired; the partner continues using the same relay
-  address. Old-address ciphertext is dropped. A stale client that knows the
-  ticket can reclaim that role, so tickets must be unguessable secret-derived
-  hashes, never public IDs. There is no additional identity authentication here;
-  QUIC and application cryptography authenticate the peers. UDP source spoofing
-  remains a risk: this is not a full TURN challenge/cookie protocol.
-* Both peers must re-register following allocation expiry or a server restart.
-  Retry registrations with backoff until notified. Keep active quiet sessions
-  alive using end-to-end QUIC keepalives at an interval below 60 seconds.
+### Wire format
 
-Allocations (pending and paired) expire after **60 s without accepted traffic**
-or **6 h from first registration**, even if busy; a same-role replacement never
-extends that hard deadline. Cleanup runs every second and expired sources cannot
-forward. There are at most **4096 allocations** (including pending), and at most
-2048 pending by default. State and rate accounting are memory-only; no tickets,
-addresses or payloads are logged. A single reusable 65,535-byte receive buffer
-bounds payload memory; there is no application queue, retransmission or file buffering.
+Offsets are zero-based byte offsets, ranges are half-open, and multi-byte integers
+are big-endian. There are no separators, length prefixes or text encodings.
+
+* `ticket` (16 bytes): an opaque, unguessable keyed hash of the session secret. Both
+  peers derive the same ticket.
+* `role` (1 byte): `0` for the initiator and `1` for its partner. Any other value is
+  malformed.
+* `s` (16 bytes): a random **rebind secret**, generated per role. `H = SHA-256(s)`
+  (32 bytes) is its commitment.
+* `cookie` (16 bytes): opaque to clients. It is bound to the source IP and port,
+  the exact 53-byte Hello (ticket, role and H) and a 30-second time bucket.
+
+| Message | Direction | Bytes | Length |
+|---|---|---|---|
+| Hello | client → relay | `[0..4)` `NRU2`, `[4..20)` ticket, `[20]` role, `[21..53)` H | 53 |
+| Challenge | relay → client | `[0..4)` `NRC2`, `[4..20)` cookie | 20 |
+| Register | client → relay | `[0..53)` Hello, `[53..69)` the cookie returned for that Hello | 69 |
+| Rebind | client → relay | `[0..69)` Register whose Hello carries the **new** H′, `[69..85)` the **previous** s | 85 |
+| Notice | relay → client | `[0..4)` `NRA2`, `[4..20)` ticket, `[20]` the recipient's role | 21 |
+| Data | both | Any datagram not starting with `NRU2`, forwarded verbatim | any |
+
+The message type comes from the length (53, 69 or 85). An `NRU2` datagram of any other length,
+or with a role above 1, is dropped silently. Every `NRU2` datagram is control
+traffic and is never forwarded, even after pairing. (A QUIC short-header packet
+that happens to start with these 4 bytes is dropped, and QUIC retransmits it.)
+
+### Sequence
+
+```mermaid
+sequenceDiagram
+    participant A as Peer A (role 0)
+    participant R as Relay
+    participant B as Peer B (role 1)
+    A->>R: Hello NRU2|T|0|H(sA) (53 B)
+    R->>A: Challenge NRC2|cA (20 B)
+    A->>R: Register NRU2|T|0|H(sA)|cA (69 B)
+    Note over R: pending allocation, no reply
+    B->>R: Hello NRU2|T|1|H(sB)
+    R->>B: Challenge NRC2|cB
+    B->>R: Register NRU2|T|1|H(sB)|cB
+    R->>A: Notice NRA2|T|0 (21 B)
+    R->>B: Notice NRA2|T|1 (21 B)
+    A->>R: QUIC datagram
+    R->>B: same bytes
+    Note over A: NAT rebinding, new source IP:port, new secret sA2
+    A->>R: Hello NRU2|T|0|H(sA2) (from the new address)
+    R->>A: Challenge NRC2|cA2 (bound to the new address and H(sA2))
+    A->>R: Rebind NRU2|T|0|H(sA2)|cA2|sA (85 B)
+    Note over R: SHA-256(sA) equals stored H(sA): move role, store H(sA2)
+    R->>A: Notice NRA2|T|0
+```
+
+### Rules
+
+1. **Return-path cookie.** Each Hello gets one Challenge, and nothing else changes.
+   The cookie is the first 16 bytes of
+   `HMAC-SHA256(k, "neutrino-relay/udp-v2/cookie" ‖ family ‖ ip ‖ port ‖ ticket ‖ role ‖ H ‖ bucket)`.
+   `family` is one byte, `4` or `6`. `ip` is 4 or 16 octets. `port` is a u16, and
+   `bucket` = ⌊seconds since relay start / 30⌋ as a u64. `k` is 32 random bytes
+   drawn per process and replaced every 300 s. The previous key is kept, and the
+   current and previous buckets are both accepted, so a cookie lasts 30–60 s. Keys
+   are zeroized when they are dropped. A Register or Rebind is processed only if
+   its cookie verifies for the datagram's own source address. A restart
+   invalidates all cookies.
+2. **Allocation.** A Register for an unknown ticket creates a pending allocation
+   and gets no reply. A Register for the vacant role of a pending allocation
+   completes pairing, and each peer receives a Notice with its own role. A Rebind
+   cannot create or join an allocation.
+3. **One binding per source.** A source IP:port is bound to exactly one
+   (ticket, role) until expiry. Anything else it registers is dropped, so the two
+   roles need different source addresses.
+4. **Retry.** If a Register or Rebind comes from the role's current address and
+   its H equals the stored commitment, it is an idempotent retry. A retry renews
+   the idle timer and, once the allocation is paired, returns one Notice to the
+   sender. Use retries when a Notice is lost, with backoff, getting a fresh
+   cookie when the old one expires.
+5. **Rebind.** A source that is not the role's current address must send a Rebind.
+   To do that, the client generates a new secret `s′`, sends a Hello carrying
+   H′ = SHA-256(`s′`) from the new address, and sends the returned cookie
+   followed by the previous `s`. The relay accepts it only if SHA-256(`s`) equals
+   the stored H and H′ differs from it. The relay then moves the role to the new address, drops the
+   old address immediately, stores H′, and returns one Notice if paired. Each
+   revealed secret is therefore **single-use**: a replayed Rebind, or any reuse of
+   its `s`, fails because the stored commitment has changed. The client keeps
+   `s′` for its next rebind. The same message sent from the current address
+   rotates the commitment without moving. Rebinds keep the original 6 h deadline.
+6. **Forwarding.** Data from a bound source with a paired partner is forwarded
+   unchanged to the partner's current address, 1:1. Everything else is dropped.
+
+### Amplification bound
+
+Before pairing, every reply is at most as large as the datagram that caused it.
+These are payload bytes, excluding IP/UDP headers:
+
+| Trigger | Reply |
+|---|---|
+| Hello (53 B) | one 20 B Challenge to the sender |
+| Register that completes pairing (69 B) | two 21 B Notices (42 B), one to each cookie-validated address |
+| Retry / Rebind of a paired role (69 / 85 B) | one 21 B Notice to the sender |
+| Anything else, including an invalid cookie | nothing |
+
+An unvalidated source never receives forwarded data. A spoofed Hello can make
+the relay send a 20-byte Challenge to the spoofed address. That is reflection
+smaller than the request, not amplification, and it is capped at
+`NEUTRINO_RELAY_UDP_IP_CONTROL_PPS` (default 64) per second per victim group.
+
+### Quotas and expiry
+
+A **group** is an IPv4 address or an IPv6 /64. IPv4-mapped IPv6 addresses count
+as IPv4. Each group may hold at most `IP_MAX_PENDING` roles in pending
+allocations and at most `IP_MAX_TOTAL` registered roles in total, across any
+number of ports and tickets. Joining someone else's ticket uses one total slot.
+A rebind into a different group must fit that group's quota. Admission for a new
+ticket is checked in this order: the global cap of **4096 allocations**, then the
+global pending cap, then the group's quotas. All checks use incremental counters,
+so nothing is scanned per packet. A one-second timer sweeps out expired
+allocations (at most 4096) and stale rate windows (at most 16384 groups). An
+expired allocation cannot forward while it waits for that sweep.
+
+An allocation expires after **60 s without an accepted Register, Rebind or
+forwarded datagram**, or **6 h after creation**, whichever comes first. Hello and
+Challenge do not keep it alive. Pending clients retry within 60 s. Paired clients
+send end-to-end QUIC keepalives more often than every 60 s. After a relay restart
+or expiry, both peers register again from scratch.
 
 | Environment variable | Default | Meaning |
 |---|---|---|
-| `NEUTRINO_RELAY_UDP_BIND` | `0.0.0.0:3479` | UDP listen address |
-| `NEUTRINO_RELAY_UDP_MAX_PENDING` | `2048` | Maximum pending tickets (also bounded by 4096 total) |
-| `NEUTRINO_RELAY_UDP_IP_PPS` | `20000` | Ingress datagrams per source IP per second |
-| `NEUTRINO_RELAY_UDP_IP_BPS` | `33554432` | Ingress payload bytes per source IP per second |
-| `NEUTRINO_RELAY_UDP_TOTAL_BPS` | `134217728` | Total egress payload bytes per second, including notices |
+| `NEUTRINO_RELAY_UDP_BIND` | `0.0.0.0:3479` | Listen address |
+| `NEUTRINO_RELAY_UDP_MAX_PENDING` | `2048` | Global pending allocations (4096 total hard cap) |
+| `NEUTRINO_RELAY_UDP_IP_MAX_PENDING` | `8` | Roles in pending allocations per group |
+| `NEUTRINO_RELAY_UDP_IP_MAX_TOTAL` | `16` | Registered roles per group |
+| `NEUTRINO_RELAY_UDP_IP_CONTROL_PPS` | `64` | `NRU2` control datagrams per group per second |
+| `NEUTRINO_RELAY_UDP_IP_PPS` | `20000` | Ingress datagrams per group per second (all traffic) |
+| `NEUTRINO_RELAY_UDP_IP_BPS` | `33554432` | Ingress payload bytes per group per second |
+| `NEUTRINO_RELAY_UDP_TOTAL_BPS` | `134217728` | Egress payload bytes per second, including challenges and notices |
 
-Limits use one-second windows beginning with the first packet in each window;
-short bursts across boundaries are possible. IP accounting includes rejected
-packets that fit the budget and is bounded to 16,384 IPs (additional IPs are
-silently dropped until entries expire). Zero limits deny traffic; invalid numeric
-settings fail startup. Excess packets are dropped, leaving recovery and pacing
-to QUIC. IP limits aggregate peers behind a shared NAT. Egress never exceeds
-accepted raw ingress bytes plus notices: an unpaired address receives nothing
-until pairing, and its initial notice is exactly its 21-byte registration size.
-Retries send at most one equal-sized reply to their source; no response is sent
-for malformed registrations. This bounds registration amplification to 1x
-(payload bytes, excluding network headers); paired ciphertext forwarding is 1:1.
+Each rate window lasts one second from its first packet, so bursts can straddle
+a window boundary. Rejected packets still count against ingress budgets. Rate
+state is limited to 16384 groups; packets from new groups are dropped while it is
+full. A zero limit denies traffic, and an invalid value fails startup. Users
+behind a shared NAT share one group. State is in memory only. Tickets, payloads
+and addresses are not logged. One reusable 65,535-byte buffer bounds payload
+memory: there are no queues, retransmissions or file buffers. This is a minimal
+pairing relay, not a QUIC endpoint and not a TURN server.
 
-Open **UDP 3479** in the host firewall and provider firewall/security group.
-nginx proxies WebSocket only; UDP goes directly to the relay process. This mode
-is a minimal pairing relay, not interoperable with TURN clients.
+### Threat model
+
+* **Off-path spoofer.** It cannot see Challenges sent to the address it claims,
+  so it cannot allocate, pair, retry, rebind or receive data for that address. It
+  can make the relay send 20-byte Challenges to a victim, rate-limited as above,
+  and it can spend the victim group's control and ingress budgets, which delays
+  that group's handshakes.
+* **Passive observer of a Register.** It learns the ticket, the cookie and H, but
+  not `s`. Replaying the Register from elsewhere fails the cookie check. With a
+  fresh cookie of its own, it still lacks `s`.
+* **Observer of a Rebind.** It learns that `s`, which is already spent. Replaying
+  it fails.
+* **On-path attacker** that can intercept, drop or race a Rebind. It can submit
+  the revealed `s` with its own cookie and H first, taking the role over. That is
+  a denial of service for the session. It cannot decrypt or forge payloads,
+  because QUIC and Neutrino's application cryptography authenticate the peers and
+  protect the data end to end. The same attacker could simply drop packets anyway.
+* **Anyone who knows the ticket.** Before the real partner arrives, they can
+  occupy a vacant role (squatting, a DoS). Tickets must be secret-derived keyed
+  hashes, never public identifiers. The relay validates return paths, **not peer
+  identity**.
+* **Resource exhaustion.** One group holds at most 8 pending and 16 total roles
+  by default. Exhausting the global pools takes many distinct IPv4 addresses or
+  IPv6 /64s.
+
+Open UDP 3479 in both the host firewall and the provider firewall. Check a
+deployment with:
+
+```sh
+python3 deploy/verify_udp.py relay.example.com
+```
 
 ## Run your own
 
